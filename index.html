@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wordstat — частотность запросов</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--fg:#1b1f24;--mut:#667085;--bd:#d9dde3;--ac:#fc3f1d;--ok:#12805c;--err:#c62828}
+@media (prefers-color-scheme:dark){:root{--bg:#14161a;--card:#1d2026;--fg:#e8eaed;--mut:#9aa3af;--bd:#333943;--ac:#ff6a4d;--ok:#4cc38a;--err:#ff7b7b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}
+main{max-width:960px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:22px;margin:0 0 4px}
+p.sub{color:var(--mut);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:16px;margin-bottom:16px}
+label{display:block;font-size:13px;color:var(--mut);margin:0 0 4px}
+input,textarea,select{width:100%;padding:8px 10px;border:1px solid var(--bd);border-radius:6px;background:var(--bg);color:var(--fg);font:inherit}
+textarea{min-height:180px;resize:vertical;font-family:ui-monospace,monospace}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;margin-bottom:12px}
+button{padding:9px 16px;border:0;border-radius:6px;background:var(--ac);color:#fff;font:inherit;font-weight:600;cursor:pointer}
+button.sec{background:transparent;color:var(--fg);border:1px solid var(--bd)}
+button:disabled{opacity:.5;cursor:default}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+#status{color:var(--mut);font-size:13px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--bd)}
+th{cursor:pointer;user-select:none;white-space:nowrap}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+.err{color:var(--err)}
+details summary{cursor:pointer;color:var(--mut)}
+code{background:var(--bg);padding:1px 5px;border-radius:4px}
+.wrap{overflow-x:auto}
+</style>
+</head>
+<body>
+<main>
+<h1>Частотность запросов Wordstat</h1>
+<p class="sub">Вставьте список запросов — получите количество показов за 30 дней через Yandex Wordstat API.</p>
+
+<div class="card">
+  <div class="row">
+    <div><label for="token">OAuth-токен Wordstat API</label>
+      <input id="token" type="password" autocomplete="off" placeholder="y0_..."></div>
+    <div><label for="proxy">Прокси (URL Cloudflare Worker)</label>
+      <input id="proxy" placeholder="https://wordstat.example.workers.dev"></div>
+  </div>
+  <div class="row">
+    <div><label for="regions">ID регионов (через запятую, пусто = все)</label>
+      <input id="regions" placeholder="213, 2"></div>
+    <div><label for="devices">Устройства</label>
+      <select id="devices"><option value="">Все</option><option value="desktop">Десктоп</option><option value="phone">Телефон</option><option value="tablet">Планшет</option></select></div>
+  </div>
+  <label><input type="checkbox" id="remember" style="width:auto"> Запомнить токен и прокси в этом браузере</label>
+  <details style="margin-top:10px"><summary>Как это работает</summary>
+    <p>Токен и запросы остаются в браузере и уходят только на указанный прокси/API. Браузер не может обращаться к <code>api.wordstat.yandex.net</code> напрямую, если API не отдаёт CORS-заголовки, поэтому в репозитории есть готовый воркер <code>worker/worker.js</code> (см. README). Если CORS у API разрешён — оставьте поле прокси пустым.</p>
+  </details>
+</div>
+
+<div class="card">
+  <label for="queries">Запросы (по одному на строку)</label>
+  <textarea id="queries" placeholder="купить диван&#10;диван угловой&#10;..."></textarea>
+  <div class="bar" style="margin-top:12px">
+    <button id="run">Проверить</button>
+    <button id="stop" class="sec" disabled>Стоп</button>
+    <button id="csv" class="sec" disabled>Скачать CSV</button>
+    <button id="copy" class="sec" disabled>Копировать</button>
+    <span id="status"></span>
+  </div>
+</div>
+
+<div class="card wrap" id="out" hidden>
+  <table><thead><tr><th data-k="phrase">Запрос</th><th data-k="count" class="n">Показов / 30 дней</th><th data-k="note">Статус</th></tr></thead><tbody></tbody></table>
+</div>
+</main>
+<script>
+const API = 'https://api.wordstat.yandex.net/v1/topRequests';
+const $ = id => document.getElementById(id);
+const store = { get:k=>{try{return localStorage.getItem(k)||''}catch{return ''}}, set:(k,v)=>{try{localStorage.setItem(k,v)}catch{}}, del:k=>{try{localStorage.removeItem(k)}catch{}} };
+let rows = [], stopFlag = false, sortK = null, sortDir = -1;
+
+$('token').value = store.get('ws_token'); $('proxy').value = store.get('ws_proxy');
+$('queries').value = store.get('ws_queries');
+$('remember').checked = !!(store.get('ws_token') || store.get('ws_proxy'));
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const fmt = n => typeof n === 'number' ? n.toLocaleString('ru-RU') : '';
+
+function render() {
+  const data = rows.slice();
+  if (sortK) data.sort((a,b)=>{ const x=a[sortK]??-1, y=b[sortK]??-1; return (x>y?1:x<y?-1:0)*sortDir; });
+  $('out').hidden = !rows.length;
+  const tb = document.querySelector('tbody'); tb.textContent = '';
+  for (const r of data) {
+    const tr = document.createElement('tr');
+    const a = document.createElement('td'); a.textContent = r.phrase;
+    const b = document.createElement('td'); b.className = 'n'; b.textContent = fmt(r.count);
+    const c = document.createElement('td'); c.textContent = r.note || ''; if (r.error) c.className = 'err';
+    tr.append(a,b,c); tb.append(tr);
+  }
+}
+
+async function query(phrase, token, base, regions, device) {
+  const body = { phrase, numPhrases: 1 };
+  if (regions.length) body.regions = regions;
+  if (device) body.devices = [device];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(base, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json;charset=utf-8', 'Authorization': 'Bearer ' + token },
+      body: JSON.stringify(body)
+    });
+    if (res.status === 429) { await sleep(1500 * (attempt + 1)); continue; }
+    const text = await res.text();
+    if (!res.ok) throw new Error(res.status + ' ' + text.slice(0, 200));
+    const j = JSON.parse(text);
+    return j.totalCount ?? j.count ?? 0;
+  }
+  throw new Error('429: превышен лимит запросов');
+}
+
+$('run').onclick = async () => {
+  const token = $('token').value.trim();
+  const proxy = $('proxy').value.trim().replace(/\/+$/, '');
+  if (!token) return alert('Укажите токен');
+  const phrases = [...new Set($('queries').value.split('\n').map(s => s.trim()).filter(Boolean))];
+  if (!phrases.length) return alert('Список запросов пуст');
+  const regions = $('regions').value.split(/[,\s]+/).filter(Boolean).map(Number).filter(Number.isFinite);
+  const device = $('devices').value;
+  if ($('remember').checked) { store.set('ws_token', token); store.set('ws_proxy', proxy); } else { store.del('ws_token'); store.del('ws_proxy'); }
+  store.set('ws_queries', $('queries').value);
+
+  const base = proxy ? proxy + '/v1/topRequests' : API;
+  rows = phrases.map(phrase => ({ phrase, count: null, note: 'в очереди' }));
+  stopFlag = false; sortK = null; render();
+  $('run').disabled = true; $('stop').disabled = false; $('csv').disabled = $('copy').disabled = true;
+
+  let done = 0;
+  for (const r of rows) {
+    if (stopFlag) { r.note = 'остановлено'; continue; }
+    r.note = 'запрос…'; render();
+    try { r.count = await query(r.phrase, token, base, regions, device); r.note = ''; }
+    catch (e) { r.error = true; r.note = e.message === 'Failed to fetch' ? 'сеть/CORS: настройте прокси' : e.message; }
+    done++; $('status').textContent = `${done} / ${rows.length}`;
+    render(); await sleep(150); // ~6 req/s, ниже лимита 10 rps
+  }
+  $('run').disabled = false; $('stop').disabled = true; $('csv').disabled = $('copy').disabled = false;
+  $('status').textContent += stopFlag ? ' — остановлено' : ' — готово';
+};
+$('stop').onclick = () => { stopFlag = true; };
+
+document.querySelectorAll('th').forEach(th => th.onclick = () => {
+  const k = th.dataset.k; sortDir = sortK === k ? -sortDir : (k === 'count' ? -1 : 1); sortK = k; render();
+});
+
+const tsv = sep => rows.map(r => [r.phrase, r.count ?? '', r.note || ''].map(v => sep === ',' ? '"' + String(v).replace(/"/g,'""') + '"' : v).join(sep)).join('\n');
+$('csv').onclick = () => {
+  const blob = new Blob(['﻿"Запрос","Показов","Статус"\n' + tsv(',')], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'wordstat.csv'; a.click(); URL.revokeObjectURL(a.href);
+};
+$('copy').onclick = async () => { await navigator.clipboard.writeText(tsv('\t')); $('status').textContent = 'Скопировано'; };
+</script>
+</body>
+</html>
